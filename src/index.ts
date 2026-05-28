@@ -32,7 +32,7 @@ import { registerTracingShutdownHandlers } from "./utils/shutdownTracing";
 import { providerSecretRotationService } from "./services/providerSecretRotationService";
 import { priceAggregatorService } from "./services/priceAggregatorService";
 import { contractSanityCheckService } from "./services/contractSanityCheckService";
-
+import { BannerService } from "./services/BannerService";
 // Load environment variables
 dotenv.config();
 
@@ -330,6 +330,10 @@ process.once("SIGTERM", () => {
 });
 
 httpServer.listen(PORT, async () => {
+  BannerService.print({
+    environment: process.env.STELLAR_ENV || process.env.NODE_ENV,
+    version: process.env.ENGINE_VERSION || process.env.npm_package_version,
+  });
   console.log(`🌊 StellarFlow Backend running on port ${PORT}`);
   console.log(
     `📊 Market Rates API available at http://localhost:${PORT}/api/market-rates`,
@@ -344,11 +348,10 @@ httpServer.listen(PORT, async () => {
   let contractSanityPassed = true;
   if (contractSanityCheckService.isConfigured()) {
     try {
-      const sanityResult = await contractSanityCheckService.performSanityCheck();
+      const sanityResult =
+        await contractSanityCheckService.performSanityCheck();
       if (!sanityResult.success) {
-        console.error(
-          `❌ Contract sanity check failed: ${sanityResult.error}`,
-        );
+        console.error(`❌ Contract sanity check failed: ${sanityResult.error}`);
         console.error(
           "⛔ Preventing ingestion loop from starting due to contract failure",
         );
