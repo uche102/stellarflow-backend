@@ -17,12 +17,41 @@ import { signer } from "../signer";
 
 dotenv.config();
 
+interface PendingTimeBoundTransaction {
+  hash: string;
+  publicKey: string;
+  createdAtMs: number;
+  expiresAtMs: number;
+  timer?: ReturnType<typeof setTimeout>;
+  timedOut: boolean;
+}
+
+class LocalTransactionTimeoutError extends Error {
+  readonly code = "LOCAL_TX_TIME_BOUND_EXPIRED";
+  readonly transactionHash: string;
+  readonly publicKey: string;
+
+  constructor(transactionHash: string, publicKey: string) {
+    super(
+      `Transaction ${transactionHash} exceeded local time-bound and was recycled`,
+    );
+    this.name = "LocalTransactionTimeoutError";
+    this.transactionHash = transactionHash;
+    this.publicKey = publicKey;
+  }
+}
+
 export class StellarService {
   private server: Horizon.Server;
   private network: string;
   private readonly MAX_RETRIES = 3;
   private readonly FEE_INCREMENT_PERCENTAGE = 0.5; // 50% increase each retry
   private readonly RETRY_DELAY_MS = 2000; // 2 seconds delay between retries
+  private readonly TRANSACTION_TIME_BOUND_SECONDS = 15;
+  private readonly pendingTimeBoundTransactions = new Map<
+    string,
+    PendingTimeBoundTransaction
+  >();
 
   constructor() {
     this.network = process.env.STELLAR_NETWORK || "TESTNET";
@@ -74,7 +103,7 @@ export class StellarService {
             }),
           )
           .addMemo(Memo.text(memoId))
-          .setTimeout(60)
+          .setTimeout(this.TRANSACTION_TIME_BOUND_SECONDS)
           .build();
       },
       this.MAX_RETRIES,
@@ -116,7 +145,10 @@ export class StellarService {
           );
         }
 
-        return builder.addMemo(Memo.text(memoId)).setTimeout(60).build();
+        return builder
+          .addMemo(Memo.text(memoId))
+          .setTimeout(this.TRANSACTION_TIME_BOUND_SECONDS)
+          .build();
       },
       this.MAX_RETRIES,
       baseFee,
@@ -153,7 +185,7 @@ export class StellarService {
             }),
           )
           .addMemo(Memo.text(memoId))
-          .setTimeout(60)
+          .setTimeout(this.TRANSACTION_TIME_BOUND_SECONDS)
           .build();
       },
       signatures,
@@ -194,6 +226,7 @@ export class StellarService {
         );
 
         const transaction = builderFn(sourceAccount, currentFee);
+        this.assertStrictTimeBounds(transaction);
         await assertSigningAllowed();
         
         const txHash = transaction.hash();
@@ -207,21 +240,31 @@ export class StellarService {
           })
         );
 
-        return await this.server.submitTransaction(transaction);
+        return await this.submitWithTimeoutListener(transaction, publicKey);
       } catch (error: any) {
         const resultCode = error.response?.data?.extras?.result_codes?.transaction;
 
-        if (resultCode === "tx_bad_seq") {
-          console.warn("⚠️ SequenceManager: tx_bad_seq detected. Invalidating sequence and retrying...");
+        if (resultCode === "tx_bad_seq" || this.isLocalTimeoutError(error)) {
+          console.warn(
+            "⚠️ SequenceManager: stale or invalid local transaction assignment detected. Invalidating sequence and retrying...",
+          );
           sequenceManager.invalidate(await this.getPublicKey());
         }
 
         attempt++;
-        stellarProvider.reportFailure(error);
+        if (!this.isLocalTimeoutError(error)) {
+          stellarProvider.reportFailure(error);
+        }
 
         if (this.isStuckError(error) && attempt <= maxRetries) {
-          console.warn(`⚠️ Transaction stuck or fee too low (Attempt ${attempt}). Bumping fee and retrying...`);
-          await new Promise((resolve) => setTimeout(resolve, this.RETRY_DELAY_MS));
+          console.warn(
+            `⚠️ Transaction stuck, expired, or fee too low (Attempt ${attempt}). Recycling locally and retrying...`,
+          );
+          if (!this.shouldRecycleImmediately(error)) {
+            await new Promise((resolve) =>
+              setTimeout(resolve, this.RETRY_DELAY_MS),
+            );
+          }
           continue;
         }
 
@@ -260,6 +303,7 @@ export class StellarService {
         );
 
         const transaction = builderFn(sourceAccount, currentFee);
+        this.assertStrictTimeBounds(transaction);
 
         await assertSigningAllowed();
         
@@ -292,20 +336,28 @@ export class StellarService {
           }
         }
 
-        return await this.server.submitTransaction(transaction);
+        return await this.submitWithTimeoutListener(transaction, publicKey);
       } catch (error: any) {
         const resultCode = error.response?.data?.extras?.result_codes?.transaction;
 
-        if (resultCode === "tx_bad_seq") {
-          console.warn("⚠️ SequenceManager: tx_bad_seq detected in multi-sig. Invalidating sequence...");
+        if (resultCode === "tx_bad_seq" || this.isLocalTimeoutError(error)) {
+          console.warn(
+            "⚠️ SequenceManager: stale or invalid multi-sig assignment detected. Invalidating sequence...",
+          );
           sequenceManager.invalidate(await this.getPublicKey());
         }
 
         attempt++;
-        stellarProvider.reportFailure(error);
+        if (!this.isLocalTimeoutError(error)) {
+          stellarProvider.reportFailure(error);
+        }
 
         if (this.isStuckError(error) && attempt <= maxRetries) {
-          await new Promise((resolve) => setTimeout(resolve, this.RETRY_DELAY_MS));
+          if (!this.shouldRecycleImmediately(error)) {
+            await new Promise((resolve) =>
+              setTimeout(resolve, this.RETRY_DELAY_MS),
+            );
+          }
           continue;
         }
 
@@ -316,15 +368,113 @@ export class StellarService {
     throw new Error(`Failed to submit multi-signed transaction after ${maxRetries + 1} attempts`);
   }
 
+  private assertStrictTimeBounds(transaction: Transaction): void {
+    const timeBounds = (transaction as any).timeBounds;
+    const maxTime = Number(timeBounds?.maxTime);
+    const nowSeconds = Math.floor(Date.now() / 1000);
+
+    if (
+      !Number.isFinite(maxTime) ||
+      maxTime <= nowSeconds ||
+      maxTime - nowSeconds > this.TRANSACTION_TIME_BOUND_SECONDS
+    ) {
+      throw new Error(
+        `Transaction envelope must include strict time_bounds of ${this.TRANSACTION_TIME_BOUND_SECONDS}s or less`,
+      );
+    }
+  }
+
+  private async submitWithTimeoutListener(
+    transaction: Transaction,
+    publicKey: string,
+  ): Promise<any> {
+    const pending = this.registerPendingTimeBoundTransaction(
+      transaction,
+      publicKey,
+    );
+
+    try {
+      return await Promise.race([
+        this.server.submitTransaction(transaction),
+        new Promise<never>((_, reject) => {
+          pending.timer = setTimeout(() => {
+            const activePending = this.pendingTimeBoundTransactions.get(
+              pending.hash,
+            );
+
+            if (!activePending) {
+              return;
+            }
+
+            activePending.timedOut = true;
+            this.pendingTimeBoundTransactions.delete(pending.hash);
+            console.warn(
+              `[StellarService] Transaction ${pending.hash} exceeded ${this.TRANSACTION_TIME_BOUND_SECONDS}s time-bound. Recycling local assignment.`,
+            );
+            reject(
+              new LocalTransactionTimeoutError(pending.hash, pending.publicKey),
+            );
+          }, Math.max(pending.expiresAtMs - Date.now(), 0));
+        }),
+      ]);
+    } finally {
+      this.clearPendingTimeBoundTransaction(pending.hash);
+    }
+  }
+
+  private registerPendingTimeBoundTransaction(
+    transaction: Transaction,
+    publicKey: string,
+  ): PendingTimeBoundTransaction {
+    const createdAtMs = Date.now();
+    const hash = transaction.hash().toString("hex");
+    const pending: PendingTimeBoundTransaction = {
+      hash,
+      publicKey,
+      createdAtMs,
+      expiresAtMs:
+        createdAtMs + this.TRANSACTION_TIME_BOUND_SECONDS * 1000,
+      timedOut: false,
+    };
+
+    this.pendingTimeBoundTransactions.set(hash, pending);
+    return pending;
+  }
+
+  private clearPendingTimeBoundTransaction(hash: string): void {
+    const pending = this.pendingTimeBoundTransactions.get(hash);
+
+    if (!pending) {
+      return;
+    }
+
+    if (pending.timer) {
+      clearTimeout(pending.timer);
+    }
+    this.pendingTimeBoundTransactions.delete(hash);
+  }
+
   private isStuckError(error: any): boolean {
     const resultCode = error.response?.data?.extras?.result_codes?.transaction;
     return (
+      this.isLocalTimeoutError(error) ||
       resultCode === "tx_too_late" ||
       resultCode === "tx_insufficient_fee" ||
       resultCode === "tx_bad_seq" ||
       error.message?.includes("timeout") ||
       error.code === "ECONNABORTED"
     );
+  }
+
+  private shouldRecycleImmediately(error: any): boolean {
+    const resultCode = error.response?.data?.extras?.result_codes?.transaction;
+    return this.isLocalTimeoutError(error) || resultCode === "tx_too_late";
+  }
+
+  private isLocalTimeoutError(
+    error: unknown,
+  ): error is LocalTransactionTimeoutError {
+    return error instanceof LocalTransactionTimeoutError;
   }
 
   generateMemoId(currency: string): string {
